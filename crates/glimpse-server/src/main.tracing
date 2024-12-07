@@ -1,0 +1,264 @@
+use futures::{FutureExt, SinkExt, StreamExt};
+use once_cell::sync::Lazy;
+use std::collections::HashMap;
+use std::net::SocketAddr;
+use std::sync::Arc;
+use thiserror::Error;
+use tokio::net::UdpSocket;
+use tokio::select;
+use tokio::sync::{broadcast, Mutex};
+use tokio_stream::wrappers::UnboundedReceiverStream;
+use tracing::{debug, error, info, instrument, warn};
+use warp::ws::{Message, WebSocket};
+use warp::Filter;
+
+static SHUTDOWN_CHANNEL: Lazy<broadcast::Sender<()>> = Lazy::new(|| broadcast::channel(1).0);
+
+#[derive(Error, Debug)]
+pub enum ServerError {
+    #[error("IO error: {0}")]
+    Io(#[from] std::io::Error),
+    #[error("WebSocket error: {0}")]
+    WebSocket(#[from] warp::Error),
+    #[error("Address parse error: {0}")]
+    AddrParse(#[from] std::net::AddrParseError),
+    #[error("UTF-8 decode error: {0}")]
+    Utf8(#[from] std::string::FromUtf8Error),
+    #[error("Channel send error: {0}")]
+    Channel(String),
+}
+
+type Clients = Arc<Mutex<HashMap<String, tokio::sync::mpsc::UnboundedSender<Message>>>>;
+
+pub struct Server {
+    clients: Clients,
+    ws_addr: SocketAddr,
+    udp_addr: SocketAddr,
+}
+
+impl Server {
+    pub fn new(ws_addr: SocketAddr, udp_addr: SocketAddr) -> Self {
+        info!(?ws_addr, ?udp_addr, "Creating new server instance");
+        let clients = Arc::new(Mutex::new(HashMap::new()));
+        Server {
+            clients,
+            ws_addr,
+            udp_addr,
+        }
+    }
+
+    fn create_ws_route(
+        &self,
+    ) -> impl Filter<Extract = impl warp::Reply, Error = warp::Rejection> + Clone {
+        let clients = self.clients.clone();
+        let shutdown = SHUTDOWN_CHANNEL.clone();
+        warp::ws()
+            .and(warp::any().map(move || (clients.clone(), shutdown.subscribe())))
+            .map(|ws: warp::ws::Ws, (clients, shutdown)| {
+                ws.on_upgrade(move |socket| handle_websocket_client(socket, clients, shutdown))
+            })
+    }
+
+    #[instrument(skip(self))]
+    async fn create_udp_socket(&self) -> Result<UdpSocket, ServerError> {
+        debug!(?self.udp_addr, "Creating UDP socket");
+        match UdpSocket::bind(self.udp_addr).await {
+            Ok(socket) => {
+                info!("UDP socket created successfully");
+                Ok(socket)
+            }
+            Err(e) => {
+                error!(?e, "Failed to create UDP socket");
+                Err(ServerError::Io(e))
+            }
+        }
+    }
+
+    #[instrument(skip(self))]
+    pub async fn run(&self) -> Result<(), ServerError> {
+        info!("Starting server");
+        
+        let udp_socket = self.create_udp_socket().await?;
+        info!(?self.udp_addr, "UDP server listening");
+
+        let udp_clients = self.clients.clone();
+        let udp_shutdown = SHUTDOWN_CHANNEL.subscribe();
+        let udp_handle = tokio::spawn(async move {
+            handle_udp_messages(udp_socket, udp_clients, udp_shutdown).await
+        });
+
+        info!(?self.ws_addr, "WebSocket server starting");
+        let mut ws_shutdown = SHUTDOWN_CHANNEL.subscribe();
+        let (_addr, server) = warp::serve(self.create_ws_route()).bind_with_graceful_shutdown(
+            self.ws_addr,
+            async move {
+                let _ = ws_shutdown.recv().await;
+            },
+        );
+
+        let shutdown_sender = SHUTDOWN_CHANNEL.clone();
+        tokio::spawn(async move {
+            if let Ok(()) = tokio::signal::ctrl_c().await {
+                info!("Received Ctrl+C signal");
+                if let Err(e) = shutdown_sender.send(()) {
+                    error!(?e, "Failed to send shutdown signal");
+                }
+            }
+        });
+
+        let server_handle = tokio::spawn(server);
+        info!("Server started successfully");
+
+        let _ = tokio::join!(server_handle, udp_handle);
+        info!("Server shutdown complete");
+
+        Ok(())
+    }
+
+    #[cfg(test)]
+    pub fn get_clients(&self) -> Clients {
+        self.clients.clone()
+    }
+}
+
+#[instrument(skip(ws, clients, shutdown))]
+async fn handle_websocket_client(
+    ws: WebSocket,
+    clients: Clients,
+    mut shutdown: broadcast::Receiver<()>,
+) {
+    info!("New WebSocket connection established");
+    let (mut ws_tx, mut ws_rx) = ws.split();
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<Message>();
+    let mut rx = UnboundedReceiverStream::new(rx);
+    let client_id = uuid::Uuid::new_v4().to_string();
+
+    {
+        let mut clients_lock = clients.lock().await;
+        clients_lock.insert(client_id.clone(), tx);
+        info!(?client_id, "Client registered");
+        debug!("Current client count: {}", clients_lock.len());
+    }
+
+    let ws_send_task = tokio::spawn(async move {
+        while let Some(message) = rx.next().await {
+            if let Err(e) = ws_tx.send(message).await {
+                error!(?e, "WebSocket send error");
+                break;
+            }
+        }
+    });
+
+    let mut ws_receive_task = tokio::spawn(async move {
+        while let Some(result) = ws_rx.next().await {
+            match result {
+                Ok(msg) => {
+                    debug!(?client_id, "Received WebSocket message");
+                }
+                Err(e) => {
+                    error!(?client_id, ?e, "WebSocket receive error");
+                    break;
+                }
+            }
+        }
+    });
+
+    select! {
+        _ = &mut ws_receive_task => {
+            info!(?client_id, "WebSocket connection closed by client");
+        }
+        _ = shutdown.recv() => {
+            info!(?client_id, "WebSocket connection closed by shutdown");
+        }
+    }
+
+    ws_send_task.abort();
+    ws_receive_task.abort();
+    
+    let mut clients_lock = clients.lock().await;
+    clients_lock.remove(&client_id);
+    info!(?client_id, "Client unregistered");
+    debug!("Current client count: {}", clients_lock.len());
+}
+
+#[instrument(skip(socket, clients, shutdown))]
+async fn handle_udp_messages(
+    socket: UdpSocket,
+    clients: Clients,
+    mut shutdown: broadcast::Receiver<()>,
+) {
+    let mut buf = vec![0u8; 1024];
+
+    loop {
+        select! {
+            result = socket.recv_from(&mut buf) => {
+                match result {
+                    Ok((len, addr)) => {
+                        debug!(?addr, bytes = len, "Received UDP datagram");
+                        match String::from_utf8(buf[..len].to_vec()) {
+                            Ok(message) => {
+                                debug!(?addr, ?message, "Decoded UDP message");
+                                let clients_lock = clients.lock().await;
+                                let client_count = clients_lock.len();
+                                for tx in clients_lock.values() {
+                                    if let Err(e) = tx.send(Message::text(&message)) {
+                                        error!("Failed to forward UDP message to WebSocket client: {}", e);
+                                    }
+                                }
+                                debug!(?client_count, "Forwarded UDP message to WebSocket clients");
+                            }
+                            Err(e) => {
+                                warn!(?addr, ?e, "Invalid UTF-8 in UDP message");
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        error!(?e, "UDP receive error");
+                    }
+                }
+            }
+            _ = shutdown.recv() => {
+                info!("UDP handler shutting down");
+                break;
+            }
+        }
+    }
+}
+
+#[tokio::main]
+async fn main() -> Result<(), ServerError> {
+    // Initialize tracing subscriber
+    tracing_subscriber::fmt()
+        .with_file(true)
+        .with_line_number(true)
+        .with_thread_ids(true)
+        .with_target(false)
+        .init();
+
+    info!("Starting application");
+
+    let ws_addr: SocketAddr = match "127.0.0.1:8099".parse() {
+        Ok(addr) => addr,
+        Err(e) => {
+            error!(?e, "Failed to parse WebSocket address");
+            return Err(ServerError::AddrParse(e));
+        }
+    };
+
+    let udp_addr: SocketAddr = match "127.0.0.1:8081".parse() {
+        Ok(addr) => addr,
+        Err(e) => {
+            error!(?e, "Failed to parse UDP address");
+            return Err(ServerError::AddrParse(e));
+        }
+    };
+
+    let server = Server::new(ws_addr, udp_addr);
+    if let Err(e) = server.run().await {
+        error!(?e, "Server error");
+        return Err(e);
+    }
+
+    info!("Application shutdown complete");
+    Ok(())
+}

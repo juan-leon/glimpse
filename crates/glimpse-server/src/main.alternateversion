@@ -1,0 +1,352 @@
+use futures_util::{SinkExt, StreamExt};
+use metrics::{counter, gauge, histogram};
+use std::collections::HashMap;
+use std::net::SocketAddr;
+use std::sync::Arc;
+use std::time::{Duration, Instant};
+use tokio::net::{TcpListener, TcpStream};
+use tokio::sync::Mutex;
+use tokio::time::sleep;
+use tokio_tungstenite::accept_async;
+use tokio_tungstenite::tungstenite::{Error as WsError, Message};
+use tracing::{debug, error, info, instrument, warn};
+
+// Type alias for a shared state containing connected clients
+type Clients = Arc<Mutex<HashMap<SocketAddr, ClientData>>>;
+
+// Struct to hold client-specific data
+struct ClientData {
+    sender: futures_util::stream::SplitSink<tokio_tungstenite::WebSocketStream<TcpStream>, Message>,
+    retry_count: u32,
+    last_ping: Instant,
+    connected_at: Instant,
+    messages_sent: u64,
+    messages_received: u64,
+}
+
+const MAX_RETRY_ATTEMPTS: u32 = 3;
+const PING_INTERVAL: Duration = Duration::from_secs(30);
+const PING_TIMEOUT: Duration = Duration::from_secs(10);
+const BACKOFF_BASE: Duration = Duration::from_secs(1);
+
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    // Initialize logging and metrics
+    setup_logging_and_metrics()?;
+
+    info!("Starting WebSocket server");
+    let listener = TcpListener::bind("127.0.0.1:8080").await?;
+    info!("WebSocket server listening on ws://127.0.0.1:8080");
+
+    let clients: Clients = Arc::new(Mutex::new(HashMap::new()));
+
+    // Spawn health check task
+    let health_check_clients = clients.clone();
+    tokio::spawn(async move {
+        run_health_checks(health_check_clients).await;
+    });
+
+    // Spawn metrics reporting task
+    let metrics_clients = clients.clone();
+    tokio::spawn(async move {
+        report_metrics(metrics_clients).await;
+    });
+
+    while let Ok((stream, addr)) = listener.accept().await {
+        info!(client.addr = %addr, "New connection accepted");
+        counter!("websocket.connections.total").increment(1);
+        gauge!("websocket.connections.active").increment(1.0);
+
+        let clients = clients.clone();
+
+        tokio::spawn(async move {
+            if let Err(e) = handle_connection_with_retry(stream, addr, clients).await {
+                error!(client.addr = %addr, error = %e, "Connection handler terminated with error");
+                gauge!("websocket.connections.active").decrement(1.0);
+                counter!("websocket.connections.errors").increment(1);
+            }
+        });
+    }
+
+    Ok(())
+}
+
+fn setup_logging_and_metrics() -> Result<(), Box<dyn std::error::Error>> {
+    // Initialize tracing subscriber for logging
+    tracing_subscriber::fmt()
+        .with_file(true)
+        .with_line_number(true)
+        .with_thread_ids(true)
+        .with_target(false)
+        .init();
+
+    // Initialize metrics
+    let metrics_reporter = metrics_exporter_prometheus::PrometheusBuilder::new()
+        .with_http_listener(([127, 0, 0, 1], 9000))
+        .build()?;
+
+    tokio::spawn(async move {
+        metrics_reporter.await;
+    });
+
+    Ok(())
+}
+
+#[instrument(skip(clients), fields(client.addr = %addr))]
+async fn handle_connection_with_retry(
+    stream: TcpStream,
+    addr: SocketAddr,
+    clients: Clients,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let mut retry_count = 0;
+    let connection_start = Instant::now();
+
+    loop {
+        match handle_connection(stream.try_clone()?, addr, clients.clone()).await {
+            Ok(_) => {
+                info!("Connection completed normally");
+                histogram!("websocket.connection.duration.seconds")
+                    .record(connection_start.elapsed().as_secs_f64());
+                break;
+            }
+            Err(e) => {
+                retry_count += 1;
+                counter!("websocket.connection.retries").increment(1);
+
+                if retry_count >= MAX_RETRY_ATTEMPTS {
+                    error!(error = %e, "Max retry attempts reached, giving up");
+                    counter!("websocket.connection.retry_exhausted").increment(1);
+                    break;
+                }
+
+                let backoff_duration = BACKOFF_BASE * (2_u32.pow(retry_count - 1));
+                warn!(
+                    error = %e,
+                    retry_count,
+                    backoff_seconds = backoff_duration.as_secs(),
+                    "Connection failed, attempting retry"
+                );
+
+                sleep(backoff_duration).await;
+            }
+        }
+    }
+
+    clients.lock().await.remove(&addr);
+    Ok(())
+}
+
+#[instrument(skip(stream, clients), fields(client.addr = %addr))]
+async fn handle_connection(
+    stream: TcpStream,
+    addr: SocketAddr,
+    clients: Clients,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let ws_stream = accept_async(stream).await?;
+    let (sender, mut receiver) = ws_stream.split();
+
+    // Initialize client data
+    clients.lock().await.insert(
+        addr,
+        ClientData {
+            sender,
+            retry_count: 0,
+            last_ping: Instant::now(),
+            connected_at: Instant::now(),
+            messages_sent: 0,
+            messages_received: 0,
+        },
+    );
+
+    while let Ok(Some(result)) = tokio::time::timeout(PING_TIMEOUT, receiver.next()).await {
+        match result {
+            Ok(msg) => {
+                // Update client metrics
+                if let Some(client_data) = clients.lock().await.get_mut(&addr) {
+                    client_data.last_ping = Instant::now();
+                    client_data.messages_received += 1;
+                    counter!("websocket.messages.received").increment(1);
+                }
+
+                match msg {
+                    Message::Text(text) => {
+                        debug!(message = %text, "Received text message");
+                        handle_text_message(&clients, &addr, text).await?;
+                    }
+                    Message::Binary(data) => {
+                        debug!(size = data.len(), "Received binary message");
+                        handle_binary_message(&clients, &addr, data).await?;
+                    }
+                    Message::Ping(data) => {
+                        debug!("Received ping");
+                        handle_ping(&clients, &addr, data).await?;
+                        counter!("websocket.ping.received").increment(1);
+                    }
+                    Message::Close(_) => {
+                        info!("Received close frame");
+                        counter!("websocket.close.received").increment(1);
+                        break;
+                    }
+                    _ => {}
+                }
+            }
+            Err(e) => {
+                match &e {
+                    WsError::Protocol(_) => {
+                        warn!(error = %e, "Protocol error occurred");
+                        counter!("websocket.errors.protocol").increment(1);
+
+                        if let Some(client_data) = clients.lock().await.get_mut(&addr) {
+                            client_data.retry_count += 1;
+                            if client_data.retry_count >= MAX_RETRY_ATTEMPTS {
+                                error!(error = %e, "Max protocol errors reached");
+                                return Err(Box::new(e));
+                            }
+                        }
+                    }
+                    WsError::Capacity(_) => {
+                        warn!(error = %e, "Capacity error occurred");
+                        counter!("websocket.errors.capacity").increment(1);
+                        sleep(Duration::from_millis(100)).await;
+                        continue;
+                    }
+                    _ => {
+                        error!(error = %e, "WebSocket error occurred");
+                        counter!("websocket.errors.other").increment(1);
+                        return Err(Box::new(e));
+                    }
+                }
+            }
+        }
+    }
+
+    Ok(())
+}
+
+async fn run_health_checks(clients: Clients) {
+    loop {
+        sleep(PING_INTERVAL).await;
+
+        let mut disconnected_clients = Vec::new();
+
+        {
+            let clients_lock = clients.lock().await;
+            for (&addr, client_data) in clients_lock.iter() {
+                if client_data.last_ping.elapsed() > PING_TIMEOUT {
+                    warn!(
+                        client.addr = %addr,
+                        last_ping_seconds = client_data.last_ping.elapsed().as_secs(),
+                        "Client unresponsive"
+                    );
+                    disconnected_clients.push(addr);
+                }
+            }
+        }
+
+        if !disconnected_clients.is_empty() {
+            let mut clients_lock = clients.lock().await;
+            for addr in disconnected_clients {
+                info!(client.addr = %addr, "Removing unresponsive client");
+                clients_lock.remove(&addr);
+                counter!("websocket.connections.timeouts").increment(1);
+                gauge!("websocket.connections.active").decrement(1.0);
+            }
+        }
+    }
+}
+
+async fn report_metrics(clients: Clients) {
+    loop {
+        sleep(Duration::from_secs(60)).await;
+
+        let clients_lock = clients.lock().await;
+
+        // Report client-specific metrics
+        for (addr, client_data) in clients_lock.iter() {
+            let connection_duration = client_data.connected_at.elapsed().as_secs_f64();
+            let client_labels = [("client_addr", addr.to_string())];
+
+            gauge!("websocket.client.connection.duration.seconds", &client_labels)
+                .set(connection_duration);
+            gauge!("websocket.client.messages.sent", &client_labels)
+                .set(client_data.messages_sent as f64);
+            gauge!("websocket.client.messages.received", &client_labels)
+                .set(client_data.messages_received as f64);
+        }
+
+        // Report global metrics
+        gauge!("websocket.connections.count").set(clients_lock.len() as f64);
+    }
+}
+
+#[instrument(skip(clients))]
+async fn handle_text_message(
+    clients: &Clients,
+    sender_addr: &SocketAddr,
+    text: String,
+) -> Result<(), Box<dyn std::error::Error>> {
+    debug!(client.addr = %sender_addr, message = %text, "Broadcasting text message");
+    broadcast_message(clients, sender_addr, Message::Text(text)).await?;
+    Ok(())
+}
+
+#[instrument(skip(clients, data))]
+async fn handle_binary_message(
+    clients: &Clients,
+    sender_addr: &SocketAddr,
+    data: Vec<u8>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    debug!(client.addr = %sender_addr, size = data.len(), "Broadcasting binary message");
+    broadcast_message(clients, sender_addr, Message::Binary(data)).await?;
+    Ok(())
+}
+
+#[instrument(skip(clients, data))]
+async fn handle_ping(
+    clients: &Clients,
+    addr: &SocketAddr,
+    data: Vec<u8>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    if let Some(client_data) = clients.lock().await.get_mut(addr) {
+        client_data.sender.send(Message::Pong(data)).await?;
+        counter!("websocket.pong.sent").increment(1);
+    }
+    Ok(())
+}
+
+#[instrument(skip(clients, message))]
+async fn broadcast_message(
+    clients: &Clients,
+    sender_addr: &SocketAddr,
+    message: Message,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let mut clients_lock = clients.lock().await;
+
+    for (&addr, client_data) in clients_lock.iter_mut() {
+        if addr != *sender_addr {
+            if let Err(e) = client_data.sender.send(message.clone()).await {
+                warn!(
+                    error = %e,
+                    client.addr = %addr,
+                    "Error broadcasting message"
+                );
+                counter!("websocket.broadcast.errors").increment(1);
+
+                client_data.retry_count += 1;
+                if client_data.retry_count >= MAX_RETRY_ATTEMPTS {
+                    error!(
+                        error = %e,
+                        client.addr = %addr,
+                        "Max broadcast retries reached"
+                    );
+                    return Err(Box::new(e));
+                }
+            } else {
+                client_data.messages_sent += 1;
+                counter!("websocket.messages.sent").increment(1);
+            }
+        }
+    }
+
+    Ok(())
+}

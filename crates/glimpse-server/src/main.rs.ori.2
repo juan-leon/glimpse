@@ -1,0 +1,243 @@
+use futures_util::{SinkExt, StreamExt};
+use std::collections::HashMap;
+use std::net::SocketAddr;
+use std::sync::Arc;
+use std::time::Duration;
+use tokio::net::{TcpListener, TcpStream};
+use tokio::sync::Mutex;
+use tokio::time::sleep;
+use tokio_tungstenite::accept_async;
+use tokio_tungstenite::tungstenite::{Error as WsError, Message};
+
+// Type alias for a shared state containing connected clients
+type Clients = Arc<Mutex<HashMap<SocketAddr, ClientData>>>;
+
+// Struct to hold client-specific data
+struct ClientData {
+    sender: futures_util::stream::SplitSink<tokio_tungstenite::WebSocketStream<TcpStream>, Message>,
+    retry_count: u32,
+    last_ping: std::time::Instant,
+}
+
+const MAX_RETRY_ATTEMPTS: u32 = 3;
+const PING_INTERVAL: Duration = Duration::from_secs(30);
+const PING_TIMEOUT: Duration = Duration::from_secs(10);
+const BACKOFF_BASE: Duration = Duration::from_secs(1);
+
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let listener = TcpListener::bind("127.0.0.1:8080").await?;
+    println!("WebSocket server listening on ws://127.0.0.1:8080");
+
+    let clients: Clients = Arc::new(Mutex::new(HashMap::new()));
+
+    // Spawn health check task
+    let health_check_clients = clients.clone();
+    tokio::spawn(async move {
+        run_health_checks(health_check_clients).await;
+    });
+
+    while let Ok((stream, addr)) = listener.accept().await {
+        println!("New connection from: {}", addr);
+        let clients = clients.clone();
+
+        tokio::spawn(async move {
+            if let Err(e) = handle_connection_with_retry(stream, addr, clients).await {
+                println!("Connection handler error for {}: {}", addr, e);
+            }
+        });
+    }
+
+    Ok(())
+}
+
+async fn handle_connection_with_retry(
+    stream: TcpStream,
+    addr: SocketAddr,
+    clients: Clients,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let mut retry_count = 0;
+
+    loop {
+        match handle_connection(stream.try_clone()?, addr, clients.clone()).await {
+            Ok(_) => {
+                println!("Connection {} completed normally", addr);
+                break;
+            }
+            Err(e) => {
+                retry_count += 1;
+                if retry_count >= MAX_RETRY_ATTEMPTS {
+                    println!("Max retry attempts reached for {}, giving up", addr);
+                    break;
+                }
+
+                let backoff_duration = BACKOFF_BASE * (2_u32.pow(retry_count - 1));
+                println!(
+                    "Connection {} failed: {}. Retrying in {} seconds... (Attempt {}/{})",
+                    addr,
+                    e,
+                    backoff_duration.as_secs(),
+                    retry_count,
+                    MAX_RETRY_ATTEMPTS
+                );
+
+                sleep(backoff_duration).await;
+            }
+        }
+    }
+
+    // Clean up client data when all retries are exhausted
+    clients.lock().await.remove(&addr);
+    Ok(())
+}
+
+async fn handle_connection(
+    stream: TcpStream,
+    addr: SocketAddr,
+    clients: Clients,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let ws_stream = accept_async(stream).await?;
+    let (sender, mut receiver) = ws_stream.split();
+
+    // Initialize client data
+    clients.lock().await.insert(
+        addr,
+        ClientData {
+            sender,
+            retry_count: 0,
+            last_ping: std::time::Instant::now(),
+        },
+    );
+
+    // Handle incoming messages with timeout
+    while let Ok(Some(result)) = tokio::time::timeout(PING_TIMEOUT, receiver.next()).await {
+        match result {
+            Ok(msg) => {
+                // Update last ping time for the client
+                if let Some(client_data) = clients.lock().await.get_mut(&addr) {
+                    client_data.last_ping = std::time::Instant::now();
+                }
+
+                match msg {
+                    Message::Text(text) => {
+                        handle_text_message(&clients, &addr, text).await?;
+                    }
+                    Message::Binary(data) => {
+                        handle_binary_message(&clients, &addr, data).await?;
+                    }
+                    Message::Ping(data) => {
+                        handle_ping(&clients, &addr, data).await?;
+                    }
+                    Message::Close(_) => {
+                        println!("Received close frame from {}", addr);
+                        break;
+                    }
+                    _ => {}
+                }
+            }
+            Err(e) => {
+                // Handle different types of WebSocket errors
+                match e {
+                    WsError::Protocol(_) => {
+                        // Protocol errors might be recoverable
+                        if let Some(client_data) = clients.lock().await.get_mut(&addr) {
+                            client_data.retry_count += 1;
+                            if client_data.retry_count >= MAX_RETRY_ATTEMPTS {
+                                return Err(Box::new(e));
+                            }
+                        }
+                    }
+                    WsError::Capacity(_) => {
+                        // Buffer capacity errors - implement backpressure
+                        sleep(Duration::from_millis(100)).await;
+                        continue;
+                    }
+                    _ => return Err(Box::new(e)),
+                }
+            }
+        }
+    }
+
+    Ok(())
+}
+
+async fn run_health_checks(clients: Clients) {
+    loop {
+        sleep(PING_INTERVAL).await;
+
+        let mut disconnected_clients = Vec::new();
+
+        // Check each client's last ping time
+        {
+            let clients_lock = clients.lock().await;
+            for (&addr, client_data) in clients_lock.iter() {
+                if client_data.last_ping.elapsed() > PING_TIMEOUT {
+                    disconnected_clients.push(addr);
+                }
+            }
+        }
+
+        // Remove disconnected clients
+        if !disconnected_clients.is_empty() {
+            let mut clients_lock = clients.lock().await;
+            for addr in disconnected_clients {
+                println!("Removing unresponsive client: {}", addr);
+                clients_lock.remove(&addr);
+            }
+        }
+    }
+}
+
+async fn handle_text_message(
+    clients: &Clients,
+    sender_addr: &SocketAddr,
+    text: String,
+) -> Result<(), Box<dyn std::error::Error>> {
+    println!("Received message from {}: {}", sender_addr, text);
+    broadcast_message(clients, sender_addr, Message::Text(text)).await?;
+    Ok(())
+}
+
+async fn handle_binary_message(
+    clients: &Clients,
+    sender_addr: &SocketAddr,
+    data: Vec<u8>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    println!("Received binary message from {}: {} bytes", sender_addr, data.len());
+    broadcast_message(clients, sender_addr, Message::Binary(data)).await?;
+    Ok(())
+}
+
+async fn handle_ping(
+    clients: &Clients,
+    addr: &SocketAddr,
+    data: Vec<u8>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    if let Some(client_data) = clients.lock().await.get_mut(addr) {
+        client_data.sender.send(Message::Pong(data)).await?;
+    }
+    Ok(())
+}
+
+async fn broadcast_message(
+    clients: &Clients,
+    sender_addr: &SocketAddr,
+    message: Message,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let mut clients_lock = clients.lock().await;
+
+    for (&addr, client_data) in clients_lock.iter_mut() {
+        if addr != *sender_addr {
+            if let Err(e) = client_data.sender.send(message.clone()).await {
+                println!("Error sending message to {}: {}", addr, e);
+                client_data.retry_count += 1;
+
+                if client_data.retry_count >= MAX_RETRY_ATTEMPTS {
+                    return Err(Box::new(e));
+                }
+            }
+        }
+    }
+
+    Ok(())
+}

@@ -1,0 +1,23 @@
+[workspace]
+members = [
+    "crates/glimpse-core",
+    "crates/glimpse-server",
+    "crates/glimpse-web",
+]
+resolver = "2"
+
+[workspace.package]
+version = "0.1.0"
+authors = ["JuanLeon Lahoz <juanleon.lahoz@gmail.com>"]
+edition = "2021"
+license = "Apache-2.0"
+description = "Track fast moving metrics"
+documentation = "https://github.com/juan-leon/glimpse/"
+homepage = "https://github.com/juan-leon/glimpse/"
+repository = "https://github.com/juan-leon/glimpse/"
+readme = "README.md"
+
+[workspace.dependencies]
+tokio = { version = "1.32", features = ["full"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"

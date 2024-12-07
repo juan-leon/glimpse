@@ -1,0 +1,17 @@
+[package]
+name = "glimpse-server"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+
+[dependencies]
+glimpse-core = { path = "../glimpse-core" }
+tokio = { workspace = true }
+tokio-tungstenite = "0.20"
+futures-util = "0.3"
+
+tracing = { version = "0.1", features = ["attributes"] }
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+tracing-appender = "0.2"
+tracing-futures = "0.2"
